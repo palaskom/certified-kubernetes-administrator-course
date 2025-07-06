@@ -1,0 +1,72 @@
+#cloud-config
+#
+# cloud-init config for Kubernetes control plane nodes.
+#
+# Note: This file is not executed directly. It is passed to Multipass
+# via the --cloud-init flag.
+
+# Set a predictable hostname
+hostname: "infra-controlplane-1" #"{{ ds.meta_data.local_hostname }}"
+# preserve_hostname: false
+
+# Enable password authentication for SSH
+ssh_pwauth: true
+
+# Add the ubuntu user to the sudo group and set a password
+users:
+  - name: ubuntu
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    passwd: "$6$rounds=4096$saltsalt$r1j35hA3bEaN6a1b.Y2L/x2gJvjS5a4g2g3h4i5j6k7l8m9n0o1p2q3r4s5t6u7" # password is "ubuntu"
+    shell: /bin/bash
+
+# Write the setup scripts to the VM
+write_files:
+  - path: /opt/k8s-scripts/01-setup-kernel.sh
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      echo "[TASK 1] Load required kernel modules"
+      sudo modprobe overlay
+      sudo modprobe br_netfilter
+      echo "[TASK 2] Set required networking parameters"
+      sudo sysctl -w net.ipv4.ip_forward=1
+      sudo sysctl -w net.bridge.bridge-nf-call-iptables=1
+      sudo sysctl -w net.bridge.bridge-nf-call-ip6tables=1
+
+  - path: /opt/k8s-scripts/02-install-kube-tools.sh
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      echo "[TASK 1] Install and configure containerd"
+      sudo apt-get update
+      sudo apt-get install -y containerd
+      sudo mkdir -p /etc/containerd
+      containerd config default | sudo tee /etc/containerd/config.toml >/dev/null 2>&1
+      sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+      echo "[TASK 1.1] Update sandbox image to match kubeadm expectation"
+      sudo sed -i 's|sandbox_image = "registry.k8s.io/pause:3.8"|sandbox_image = "registry.k8s.io/pause:3.10"|' /etc/containerd/config.toml
+      sudo systemctl restart containerd
+      echo "[TASK 2] Install Kubernetes components"
+      KUBE_LATEST=$(curl -L -s https://dl.k8s.io/release/stable.txt | awk 'BEGIN { FS="." } { printf "%s.%s", $1, $2 }')
+      sudo apt-get install -y apt-transport-https ca-certificates curl
+      sudo mkdir -p /etc/apt/keyrings
+      curl -fsSL https://pkgs.k8s.io/core:/stable:/${KUBE_LATEST}/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/${KUBE_LATEST}/deb/ /" | sudo tee /etc/apt/sources.list.d/kubernetes.list
+      sudo apt-get update
+      sudo apt-get install -y kubelet kubeadm kubectl
+      sudo apt-mark hold kubelet kubeadm kubectl
+      echo "[TASK 3] Configure crictl"
+      sudo crictl config --set runtime-endpoint=unix:///run/containerd/containerd.sock --set image-endpoint=unix:///run/containerd/containerd.sock
+      echo "[TASK 4] Set up kubelet to use node IP"
+      PRIMARY_IP=$(ip -4 addr show eth0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+      cat <<EOF | sudo tee /etc/default/kubelet
+      KUBELET_EXTRA_ARGS='--node-ip='${PRIMARY_IP}''
+      EOF
+
+# Run the setup scripts
+runcmd:
+  - [ touch, /tmp/cloud-init-ran-here.txt ]
+  - /opt/k8s-scripts/01-setup-kernel.sh
+  - /opt/k8s-scripts/02-install-kube-tools.sh
